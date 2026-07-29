@@ -1,0 +1,16 @@
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfvars
+!example.tfvars
+build/
+
+# Also ignore generated install credentials (written by bootstrap_installs.py)
+# — kept in repo-level installs/.gitignore

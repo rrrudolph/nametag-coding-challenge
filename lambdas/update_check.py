@@ -1,80 +1,96 @@
 """Update-check lambda (behind API Gateway + Cognito authorizer).
 
 Client polls with its currently-running version. We resolve the effective
-version for that client (pin ?? latest) and return either "no update"
-(304-equivalent) or version metadata + a presigned S3 download URL.
+version for that client (client pin ?? platform pin ?? latest) and return
+either 304 or version metadata + a presigned S3 download URL.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
 import boto3
 
-PINS_TABLE = os.environ.get("PINS_TABLE", "client-version-pins")
-RELEASES_TABLE = os.environ.get("RELEASES_TABLE", "releases")
-RELEASES_BUCKET = os.environ.get("RELEASES_BUCKET", "releases-bucket")
+PINS_TABLE = os.environ["PINS_TABLE"]
+RELEASES_TABLE = os.environ["RELEASES_TABLE"]
+RELEASES_BUCKET = os.environ["RELEASES_BUCKET"]
 PRESIGN_TTL_SECONDS = 900
-LATEST_CACHE_TTL_SECONDS = 60
+LATEST_CACHE_TTL_SECONDS = 5  # short for live demos; raise for production
 
 dynamodb = boto3.resource("dynamodb")
 s3 = boto3.client("s3")
+pins_table = dynamodb.Table(PINS_TABLE)
+releases_table = dynamodb.Table(RELEASES_TABLE)
 
-# Warm-invocation cache for the latest release record: (record, fetched_at).
-_latest_cache: tuple[dict, float] | None = None
+# Warm-invocation cache: platform -> (record, fetched_at)
+_latest_cache: dict[str, tuple[dict, float]] = {}
+
+
+def _response(status: int, body=None) -> dict:
+    if body is None:
+        return {"statusCode": status, "body": ""}
+    return {
+        "statusCode": status,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps(body),
+    }
 
 
 def _client_id_from_event(event: dict) -> str:
-    """Client identity for pin lookups: the Cognito `sub` claim.
-
-    Each install is provisioned with its own credentials (client_credentials
-    flow), so `sub` maps 1:1 to an install. Crucially it's signed into the
-    JWT — unlike a self-reported hardware/app ID header, a client can't
-    spoof it to dodge its own pin or read another client's.
-    """
+    """Install identity = Cognito `sub` (app client id from client_credentials)."""
     return event["requestContext"]["authorizer"]["jwt"]["claims"]["sub"]
 
 
+def _item_to_release(item: dict) -> dict:
+    version = item["version"]
+    if version == "latest":
+        version = item["target_version"]
+    return {
+        "version": version,
+        "sha256": item["sha256"],
+        "s3_key": item["s3_key"],
+        "size": int(item["size"]),
+    }
+
+
 def _resolve_pin(client_id: str, platform: str) -> str | None:
-    """Most-specific pin wins: client pin, then platform pin, then None.
-
-    A bad release usually breaks a platform cohort (OS/arch combo), not a
-    single machine — so pins can target either scope in one sparse table:
-
-        pin_key = "client#<sub>"          # this one install
-        pin_key = "platform#<os>/<arch>"  # everyone on that platform
-
-    One BatchGetItem fetches both keys; most polls miss both (cheap).
-    Platform is self-reported by the client, which is fine here: lying about
-    your platform only gets you the wrong binary — it isn't an escalation.
-    """
-    # TODO: BatchGetItem on PINS_TABLE for [f"client#{client_id}", f"platform#{platform}"]
-    # TODO: return client pin if present, else platform pin, else None
+    """Most-specific pin wins: client pin, then platform pin, then None."""
+    keys = [
+        {"pin_key": f"client#{client_id}"},
+        {"pin_key": f"platform#{platform}"},
+    ]
+    result = dynamodb.batch_get_item(
+        RequestItems={PINS_TABLE: {"Keys": keys}},
+    )
+    items = {i["pin_key"]: i for i in result.get("Responses", {}).get(PINS_TABLE, [])}
+    for key in (f"client#{client_id}", f"platform#{platform}"):
+        if key in items and "version" in items[key]:
+            return items[key]["version"]
     return None
 
 
 def _get_latest_release(platform: str) -> dict:
-    """Latest release record for a platform, cached across warm invocations.
+    cached = _latest_cache.get(platform)
+    if cached is not None and time.time() - cached[1] < LATEST_CACHE_TTL_SECONDS:
+        return cached[0]
 
-    Binaries are per-platform, so release records are keyed by (version,
-    platform). Record shape: {"version": str, "sha256": str, "s3_key": str,
-    "size": int}
-    """
-    global _latest_cache
-    # TODO: cache per platform (dict keyed by platform), not one global tuple
-    if _latest_cache is not None and time.time() - _latest_cache[1] < LATEST_CACHE_TTL_SECONDS:
-        return _latest_cache[0]
-    # TODO: fetch from RELEASES_TABLE (e.g. GetItem on a well-known "latest" key)
-    record: dict = {}
-    _latest_cache = (record, time.time())
+    resp = releases_table.get_item(Key={"version": "latest", "platform": platform})
+    item = resp.get("Item")
+    if not item:
+        raise KeyError(f"no latest release for platform {platform}")
+    record = _item_to_release(item)
+    _latest_cache[platform] = (record, time.time())
     return record
 
 
 def _get_release(version: str, platform: str) -> dict:
-    """Release record for a specific (possibly pinned) version + platform."""
-    # TODO: GetItem on RELEASES_TABLE by (version, platform)
-    raise NotImplementedError
+    resp = releases_table.get_item(Key={"version": version, "platform": platform})
+    item = resp.get("Item")
+    if not item:
+        raise KeyError(f"release {version} / {platform} not found")
+    return _item_to_release(item)
 
 
 def _presign_download(s3_key: str) -> str:
@@ -89,24 +105,29 @@ def handler(event: dict, context) -> dict:
     client_id = _client_id_from_event(event)
     params = event.get("queryStringParameters") or {}
     client_version = params.get("current_version")
-    platform = params.get("platform")  # e.g. "linux/amd64", "darwin/arm64"
-    # TODO: 400 if current_version or platform missing
+    platform = params.get("platform")
+    if not client_version or not platform:
+        return _response(400, {"error": "current_version and platform are required"})
 
-    pinned = _resolve_pin(client_id, platform)
-    release = _get_release(pinned, platform) if pinned else _get_latest_release(platform)
-    effective_version = release["version"]
+    try:
+        pinned = _resolve_pin(client_id, platform)
+        release = (
+            _get_release(pinned, platform)
+            if pinned
+            else _get_latest_release(platform)
+        )
+    except KeyError as exc:
+        return _response(404, {"error": str(exc)})
 
-    if effective_version == client_version:
-        # No update (and no presigning work) on the common path.
-        return {"statusCode": 304, "body": ""}
+    if release["version"] == client_version:
+        return _response(304)
 
-    # TODO: json.dumps body, set content-type header
-    return {
-        "statusCode": 200,
-        "body": {
-            "version": effective_version,
+    return _response(
+        200,
+        {
+            "version": release["version"],
             "sha256": release["sha256"],
             "size": release["size"],
             "download_url": _presign_download(release["s3_key"]),
         },
-    }
+    )

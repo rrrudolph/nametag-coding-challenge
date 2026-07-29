@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Release zips built by scripts/publish_release.py
+build/

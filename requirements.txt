@@ -1,0 +1,5 @@
+# Publisher/admin scripts only — the client updater is stdlib-only on purpose.
+boto3
+
+# Test suite
+pytest
