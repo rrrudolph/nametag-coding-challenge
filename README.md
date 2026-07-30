@@ -4,7 +4,7 @@ ___Write a client-side program that will update itself when a new version is rel
 
 1. Clients will poll a lambda to check for version updates. The lambda will return a presigned S3 download link if there is a new version available. 
 
-2. The lambda is only be accessible via an API Gateway endpoint and clients will authenticate using a JWT from Cognito.
+2. The lambda is only accessible via an API Gateway endpoint and clients will authenticate using a JWT from Cognito.
 
 3. Clients will pull new versions directly from S3 via short-lived presigned URLs.
 
@@ -12,7 +12,7 @@ ___Write a client-side program that will update itself when a new version is rel
 
 #### Key functionality 
 
-In the event of runtime issues affecting only certain clients, I want to be able to roll those clients back rather than needing to deploy an emergency patch in the middle of the night to the whole customer base. This forces some extra versioning compute that wouldn't need to be there otherwise, but the tradeoff for resiliency is worth it IMO.
+In the event of runtime issues affecting only certain clients, I want to be able to roll those clients back rather than needing to deploy an emergency patch in the middle of the night to the whole customer base. This forces some extra versioning compute that wouldn't need to be there otherwise, but the tradeoff is worth it IMO.
 
 So the request flow is:
 
